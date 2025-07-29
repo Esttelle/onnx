@@ -302,6 +302,46 @@ struct InferenceContextImpl : public InferenceContext {
   NodeProto* node_;
 };
 
+struct TypeInferenceContextImpl : public InferenceContext {
+  TypeInferenceContextImpl(
+      NodeProto& n,
+      const std::unordered_map<std::string, TypeProto*>& valueTypesByName) {
+    for (const auto& input : n.input()) {
+      auto valueTypesIter = valueTypesByName.find(input);
+      if (valueTypesIter != valueTypesByName.end()) {
+        allInputTypes_.push_back(valueTypesIter->second);
+      } else {
+        allInputTypes_.push_back(nullptr);
+      }
+    }
+    allOutputTypes_.resize(n.output_size());
+  }
+
+  size_t getNumInputs() const override {
+    return allInputTypes_.size();
+  }
+  size_t getNumOutputs() const override {
+    return allOutputTypes_.size();
+  }
+
+  const TypeProto* getInputType(size_t index) const override {
+    if (index >= allInputTypes_.size()) {
+      ONNX_THROW("Input " + ONNX_NAMESPACE::to_string(index) + " is out of bounds.");
+    }
+    return allInputTypes_[index];
+  }
+
+  TypeProto* getOutputType(size_t index) override {
+    if (index >= allOutputTypes_.size()) {
+      ONNX_THROW("Output " + ONNX_NAMESPACE::to_string(index) + " is out of bounds.");
+    }
+    return &allOutputTypes_[index];
+  }
+
+  std::vector<const TypeProto*> allInputTypes_;
+  std::vector<TypeProto> allOutputTypes_;
+};
+
 struct DataPropagationContextImpl : public DataPropagationContext {
   DataPropagationContextImpl(
       NodeProto& n,
@@ -473,6 +513,14 @@ void mergeShapesAndTypes(const TypeProto_Sequence& inferredType, TypeProto_Tenso
 
 void mergeShapesAndTypes(const TypeProto& inferredType, TypeProto* existingType);
 
+void checkTypes(const TypeProto_Sequence& inferredType, const TypeProto_Sequence& existingType);
+
+void checkTypes(const TypeProto& inferredType, const TypeProto& existingType);
+
+void mergeTypes(const TypeProto_Sequence& inferredType, TypeProto_Tensor* existingType);
+
+void mergeTypes(const TypeProto& inferredType, TypeProto* existingType);
+
 ///
 /// ModelLocalFunctionsMap is a map of function id -> model local function proto
 /// All the ONNX helper utilities expect the function id == <function_proto.domain>:<function_proto.name>
@@ -496,6 +544,17 @@ ONNX_API void InferShapes(
     const ISchemaRegistry* schema_registry = OpSchemaRegistry::Instance(),
     const ShapeInferenceOptions& options = ShapeInferenceOptions(),
     DataValueMap* generated_shape_data_by_name = nullptr);
+
+ONNX_API void InferTypes(
+    ModelProto& m,
+    const ISchemaRegistry* schema_registry = OpSchemaRegistry::Instance(),
+    const ShapeInferenceOptions& options = ShapeInferenceOptions());
+
+ONNX_API void InferTypes(
+    const std::string& model_path,
+    const std::string& save_path = "",
+    const ISchemaRegistry* schema_registry = OpSchemaRegistry::Instance(),
+    const ShapeInferenceOptions& options = ShapeInferenceOptions());
 
 ///
 /// ModelLocalFunctionsMap is a map of function id -> model local function proto

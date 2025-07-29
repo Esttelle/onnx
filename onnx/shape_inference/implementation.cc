@@ -213,6 +213,86 @@ void mergeShapesAndTypes(const TypeProto& inferred_type, TypeProto* existing_typ
   }
 }
 
+template <class T>
+static void CheckTensorTypes(const T& inferred_type, const T& existing_type) {
+  if (inferred_type.elem_type() != TensorProto::UNDEFINED && existing_type.elem_type() != TensorProto::UNDEFINED &&
+      existing_type.elem_type() != inferred_type.elem_type()) {
+    std::stringstream ss;
+    ss << "Inferred elem type differs from existing elem type: (" << GetElemTypeString(inferred_type) << ") vs ("
+       << GetElemTypeString(existing_type) << ")";
+    fail_type_inference(ss.str());
+  }
+}
+
+void checkTypes(const TypeProto& inferred_type, const TypeProto& existing_type) {
+  const auto inferred_value_case = inferred_type.value_case();
+  const auto existing_value_case = existing_type.value_case();
+  if (inferred_value_case == TypeProto::ValueCase::VALUE_NOT_SET ||
+      existing_value_case == TypeProto::ValueCase::VALUE_NOT_SET) {
+    // nothing to check; will assign inferredType to undefined existingType
+    return;
+  }
+  if (inferred_value_case != existing_value_case) {
+    fail_type_inference(
+        "type case mismatch. existing=",
+        GetValueCaseString(existing_type),
+        " inferred=",
+        GetValueCaseString(inferred_type));
+  }
+
+  if (inferred_value_case == TypeProto::kTensorType && existing_value_case == TypeProto::kTensorType) {
+    CheckTensorTypes(inferred_type.tensor_type(), existing_type.tensor_type());
+  } else if (
+      inferred_value_case == TypeProto::kSparseTensorType && existing_value_case == TypeProto::kSparseTensorType) {
+    CheckTensorTypes(inferred_type.sparse_tensor_type(), existing_type.sparse_tensor_type());
+  } else if (inferred_value_case == TypeProto::kSequenceType && existing_value_case == TypeProto::kSequenceType) {
+    checkTypes(inferred_type.sequence_type().elem_type(), existing_type.sequence_type().elem_type());
+  } else if (inferred_value_case == TypeProto::kOptionalType && existing_value_case == TypeProto::kOptionalType) {
+    checkTypes(inferred_type.optional_type().elem_type(), existing_type.optional_type().elem_type());
+  } else if (
+      inferred_value_case == TypeProto::TypeProto::kMapType && existing_value_case == TypeProto::TypeProto::kMapType) {
+    if (inferred_type.map_type().key_type() != existing_type.map_type().key_type()) {
+      fail_type_inference(
+          "key type mismatch from MapProto. existing=",
+          Utils::DataTypeUtils::ToDataTypeString(existing_type.map_type().key_type()),
+          " inferred=",
+          Utils::DataTypeUtils::ToDataTypeString(inferred_type.map_type().key_type()));
+    }
+    checkTypes(inferred_type.map_type().value_type(), existing_type.map_type().value_type());
+  } else {
+    fail_type_inference("type case unsupported. existing=", existing_value_case, " inferred=", inferred_value_case);
+  }
+}
+
+template <class T>
+void mergeTensorTypes(const T& inferred_type, const T& existing_type) {
+  if (existing_type->elem_type() == TensorProto::UNDEFINED) {
+    existing_type->set_elem_type(inferred_type.elem_type());
+  }
+}
+
+void mergeTypes(const TypeProto& inferred_type, TypeProto* existing_type) {
+  // Check before merge
+  checkTypes(inferred_type, *existing_type);
+  const auto inferred_val_case = inferred_type.value_case();
+  if (inferred_val_case == TypeProto::kTensorType) {
+    mergeTensorTypes(inferred_type.tensor_type(), existing_type->mutable_tensor_type());
+  } else if (inferred_val_case == TypeProto::kSparseTensorType) {
+    mergeTensorTypes(inferred_type.sparse_tensor_type(), existing_type->mutable_sparse_tensor_type());
+  } else if (inferred_val_case == TypeProto::kSequenceType) {
+    mergeTypes(
+        inferred_type.sequence_type().elem_type(), existing_type->mutable_sequence_type()->mutable_elem_type());
+  } else if (inferred_val_case == TypeProto::kOptionalType) {
+    mergeTypes(
+        inferred_type.optional_type().elem_type(), existing_type->mutable_optional_type()->mutable_elem_type());
+  } else if (inferred_val_case == TypeProto::kMapType) {
+    if (existing_type->map_type().key_type() == TensorProto::UNDEFINED) {
+      existing_type->mutable_map_type()->set_key_type(inferred_type.map_type().key_type());
+    }
+    mergeTypes(inferred_type.map_type().value_type(), existing_type->mutable_map_type()->mutable_value_type());
+  }
+}
+
 // TypeProto_Tensor or TypeProto_SparseTensor
 template <typename TensorTypeProto>
 void GenerateSymbolicShape(TensorTypeProto* inferred_type, SymbolTable& symbol_table) {
@@ -843,6 +923,147 @@ void InferShapes(
   ModelProto model;
   LoadProtoFromPath(model_path, model);
   InferShapes(model, schema_registry, options, generated_shape_data_by_name);
+  // Save the inferred model to the original model path
+  // Use SerializeToString instead of SerializeToOstream due to LITE_PROTO
+  std::fstream output(save_path, std::ios::out | std::ios::trunc | std::ios::binary);
+  std::string model_string;
+  ONNX_TRY {
+    model.SerializeToString(&model_string);
+    output << model_string;
+  }
+  ONNX_CATCH(...) {
+    fail_check("Unable to save inferred model to the target path:", save_path);
+  }
+}
+
+void InferTypes(
+    ModelProto& m,
+    const ISchemaRegistry* schema_registry,
+    const ShapeInferenceOptions& options) {
+    GraphProto* graph = m.mutable_graph();
+    InferredTypes inferred_types(graph);
+    auto opset_imports = GetOpsetImportsFromProto(m);
+    std::unordered_map<std::string, TypeProto*> value_types_by_name;
+    td::unordered_map<std::string, TypeProto*> undefined_value_types_by_name;
+    for (auto& vi : *graph.mutable_value_info()) {
+      if (vi.has_type()) {
+        value_types_by_name[vi.name()] = vi.mutable_type();
+      } else {
+        undefined_value_types_by_name[vi.name()] = vi.mutable_type();
+      }
+    }
+    for (auto& vi : *graph.mutable_input()) {
+      if (vi.has_type()) {
+        value_types_by_name[vi.name()] = vi.mutable_type();
+      } else {
+        undefined_value_types_by_name[vi.name()] = vi.mutable_type();
+      }
+    }
+    for (auto& vi : *graph.mutable_output()) {
+      if (vi.has_type()) {
+        value_types_by_name[vi.name()] = vi.mutable_type();
+      } else {
+        undefined_value_types_by_name[vi.name()] = vi.mutable_type();
+      }
+    }
+    for (const auto& tp : graph.initializer()) {
+      TypeProto initializer_type;
+      TypeProto_Tensor* initializer_tensor_type = initializer_type.mutable_tensor_type();
+      initializer_tensor_type->set_elem_type(tp.data_type());
+      auto iter = value_types_by_name.find(tp.name());
+      if (iter != value_types_by_name.end()) {
+        checkTypes(initializer_type, *iter->second);
+      }
+      else if (ir_version >= 4) {
+        value_types_by_name[tp.name()] = std::move(initializer_type);
+      }
+    }
+    for (const auto& tp : graph.sparse_initializer()) {
+      TypeProto initializer_type;
+      auto* initializer_sparse_tensor_type = initializer_type.mutable_sparse_tensor_type();
+      initializer_sparse_tensor_type->set_elem_type(tp.values().data_type());
+      auto iter = value_types_by_name.find(tp.name());
+      if (iter != value_types_by_name.end()) {
+        checkTypes(initializer_type, *iter->second);
+      }
+      else if (ir_version >= 4) {
+        value_types_by_name[name] = std::move(initializer_type);
+      }
+    }
+    for (auto& n : *graph.mutable_node()) {
+      auto dit = opset_imports.find(n.domain());
+      if (dit == opset_imports.end()) {
+        // Both "" (ONNX_DOMAIN) and "ai.onnx" (AI_ONNX_DOMAIN) refer to the default ONNX domain
+        if (n.domain() == ONNX_DOMAIN) {
+          dit = opset_imports.find(AI_ONNX_DOMAIN);
+        }
+        if (dit == opset_imports.end()) {
+          fail_type_inference(
+              "Cannot infer type for node name ",
+              n.name(),
+              ". No opset import for domain ",
+              n.domain(),
+              " optype ",
+              n.op_type());
+        }
+      }
+      auto domain_version = dit->second;
+      const auto schema = schema_registry->GetSchema(n.op_type(), domain_version, n.domain());
+      TypeInferenceContextImpl ctx(n, value_types_by_name);
+      ONNX_TRY {
+        if (schema) {
+          if (options.check_type) {
+            schema->CheckInputOutputType(ctx);
+          }
+        } else {
+          std::cerr << "Warning: Unsupported operator " << n.op_type() << ". No schema registered for this operator."
+                      << std::endl;
+          has_unsupported_op = true;
+          continue;
+        }
+        for (int i = 0; i < n.output_size(); ++i) {
+          if (!n.output(i).empty())
+            const std::string& name = n.output(i);
+            TypeProto* inferred_type = ctx.getOutputType(i);
+            auto iter = value_types_by_name.find(name);
+            if (iter != value_types_by_name.end()) {
+              mergeTypes(*inferred_type, iter->second);
+            } else {
+              value_types_by_name[name] = inferred_types.Add(name, *inferred_type);
+              // For undefined output type, update both value_info and output for now
+              // Update existing output with undefined type: assign inferred type to it
+              iter = undefined_value_types_by_name.find(name);
+              if (iter != undefined_value_types_by_name.end()) {
+                *iter->second = *inferred_type;
+              }
+            }
+        }
+      }
+      ONNX_CATCH(const ONNX_NAMESPACE::InferenceError& ex) {
+        ONNX_HANDLE_EXCEPTION([&]() {
+          // Note: The following special handling is to accommodate custom-ops. Ideally, custom-ops
+          // should be registered with a schema in the schema registry, allowing inference to handle
+          // them. As things stand, this special handling is somewhat fragile and is not fully
+          // general either. Eg., a custom-op suppresses error-messages for subsequent nodes, but
+          // this does not work across graphs. If special handling is required, a user-option may
+          // be a better way to do it. The fragility comes from the fact that the types of the
+          // returned-values of the custom-op are unknown, and subsequent node-level inference
+          // may fail because of this.
+          if (!has_unsupported_op) {
+            inference_errors.push_back(GetErrorWithNodeInfo(n, ex));
+          }
+        });
+    }
+}
+
+void InferTypes(
+    const std::string& model_path,
+    const std::string& save_path,
+    const ISchemaRegistry* schema_registry,
+    const ShapeInferenceOptions& options) {
+  ModelProto model;
+  LoadProtoFromPath(model_path, model);
+  InferTypes(model, schema_registry, options);
   // Save the inferred model to the original model path
   // Use SerializeToString instead of SerializeToOstream due to LITE_PROTO
   std::fstream output(save_path, std::ios::out | std::ios::trunc | std::ios::binary);
