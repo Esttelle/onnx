@@ -265,7 +265,7 @@ void checkTypes(const TypeProto& inferred_type, const TypeProto& existing_type) 
 }
 
 template <class T>
-void mergeTensorTypes(const T& inferred_type, const T& existing_type) {
+void mergeTensorTypes(const T& inferred_type, const T* existing_type) {
   if (existing_type->elem_type() == TensorProto::UNDEFINED) {
     existing_type->set_elem_type(inferred_type.elem_type());
   }
@@ -944,7 +944,7 @@ void InferTypes(
     InferredTypes inferred_types(graph);
     auto opset_imports = GetOpsetImportsFromProto(m);
     std::unordered_map<std::string, TypeProto*> value_types_by_name;
-    td::unordered_map<std::string, TypeProto*> undefined_value_types_by_name;
+    std::unordered_map<std::string, TypeProto*> undefined_value_types_by_name;
     for (auto& vi : *graph.mutable_value_info()) {
       if (vi.has_type()) {
         value_types_by_name[vi.name()] = vi.mutable_type();
@@ -966,7 +966,7 @@ void InferTypes(
         undefined_value_types_by_name[vi.name()] = vi.mutable_type();
       }
     }
-    for (const auto& tp : graph.initializer()) {
+    for (const auto& tp : *graph.initializer()) {
       TypeProto initializer_type;
       TypeProto_Tensor* initializer_tensor_type = initializer_type.mutable_tensor_type();
       initializer_tensor_type->set_elem_type(tp.data_type());
@@ -974,11 +974,11 @@ void InferTypes(
       if (iter != value_types_by_name.end()) {
         checkTypes(initializer_type, *iter->second);
       }
-      else if (ir_version >= 4) {
+      else if (m.ir_version() >= 4) {
         value_types_by_name[tp.name()] = std::move(initializer_type);
       }
     }
-    for (const auto& tp : graph.sparse_initializer()) {
+    for (const auto& tp : *graph.sparse_initializer()) {
       TypeProto initializer_type;
       auto* initializer_sparse_tensor_type = initializer_type.mutable_sparse_tensor_type();
       initializer_sparse_tensor_type->set_elem_type(tp.values().data_type());
@@ -986,10 +986,11 @@ void InferTypes(
       if (iter != value_types_by_name.end()) {
         checkTypes(initializer_type, *iter->second);
       }
-      else if (ir_version >= 4) {
-        value_types_by_name[name] = std::move(initializer_type);
+      else if (m.ir_version() >= 4) {
+        value_types_by_name[tp.name()] = std::move(initializer_type);
       }
     }
+    bool has_unsupported_op = false;
     for (auto& n : *graph.mutable_node()) {
       auto dit = opset_imports.find(n.domain());
       if (dit == opset_imports.end()) {
@@ -1022,7 +1023,7 @@ void InferTypes(
           continue;
         }
         for (int i = 0; i < n.output_size(); ++i) {
-          if (!n.output(i).empty())
+          if (!n.output(i).empty()){
             const std::string& name = n.output(i);
             TypeProto* inferred_type = ctx.getOutputType(i);
             auto iter = value_types_by_name.find(name);
@@ -1037,6 +1038,7 @@ void InferTypes(
                 *iter->second = *inferred_type;
               }
             }
+          }
         }
       }
       ONNX_CATCH(const ONNX_NAMESPACE::InferenceError& ex) {
